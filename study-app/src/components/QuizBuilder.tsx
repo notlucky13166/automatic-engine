@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { getBackendReadiness } from '../api/config';
 import { ensureStudyFolder } from '../api/folders';
-import { requestQuiz } from '../api/generation';
+import { generateQuizWithOpenAI, requestQuiz } from '../api/generation';
+import { isOpenAIConfigured } from '../api/openai';
 
 const questionTypes = ['Multiple choice', 'Open response', 'Image labeling', 'Audio comprehension', 'Code review'];
 
@@ -26,6 +27,29 @@ export function QuizBuilder() {
 
   const backendReadiness = getBackendReadiness();
   const backendReady = backendReadiness === 'ready';
+  const openAIReady = isOpenAIConfigured();
+
+  type Tone = 'success' | 'warning' | 'danger';
+  const tone: Tone = backendReady
+    ? 'success'
+    : openAIReady
+      ? 'success'
+      : backendReadiness === 'partial'
+        ? 'warning'
+        : 'danger';
+  const statusLabel = backendReady
+    ? 'Supabase Edge Functions connected'
+    : openAIReady
+      ? 'Direct OpenAI (gpt-4o-mini)'
+      : backendReadiness === 'partial'
+        ? 'Missing Supabase Function URL'
+        : 'Local preview only';
+
+  const toneStyles: Record<Tone, { background: string; color: string }> = {
+    success: { background: 'rgba(34, 197, 94, 0.18)', color: '#16a34a' },
+    warning: { background: 'rgba(251, 191, 36, 0.18)', color: '#ca8a04' },
+    danger: { background: 'rgba(248, 113, 113, 0.18)', color: '#dc2626' }
+  };
 
   const questionPool = useMemo(() => {
     const basePrompts = [
@@ -70,6 +94,27 @@ export function QuizBuilder() {
             }))
           );
           setProgress(Math.max(0, Math.min(100, remoteProgress)));
+          return;
+        }
+
+        if (openAIReady) {
+          const { questions: aiQuestions, progress: aiProgress } = await generateQuizWithOpenAI({
+            topic,
+            questionCount,
+            difficulty,
+            includeImages
+          });
+
+          setQuestions(
+            aiQuestions.map((question, index) => ({
+              id: Number(question.id ?? index + 1),
+              prompt: question.prompt,
+              type: question.type,
+              difficulty: question.difficulty
+            }))
+          );
+          setFolderId('openai-session');
+          setProgress(aiProgress);
           return;
         }
 
@@ -201,21 +246,11 @@ export function QuizBuilder() {
             borderRadius: 999,
             fontSize: '0.78rem',
             fontWeight: 600,
-            background:
-              backendReadiness === 'ready'
-                ? 'rgba(34, 197, 94, 0.18)'
-                : backendReadiness === 'partial'
-                  ? 'rgba(251, 191, 36, 0.18)'
-                  : 'rgba(248, 113, 113, 0.18)',
-            color:
-              backendReadiness === 'ready'
-                ? '#16a34a'
-                : backendReadiness === 'partial'
-                  ? '#ca8a04'
-                  : '#dc2626'
+            background: toneStyles[tone].background,
+            color: toneStyles[tone].color
           }}
         >
-          Backend {backendReadiness === 'ready' ? 'connected' : backendReadiness === 'partial' ? 'missing function URL' : 'not configured'}
+          {statusLabel}
         </span>
         {folderId && <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Last folder: {folderId}</span>}
       </div>

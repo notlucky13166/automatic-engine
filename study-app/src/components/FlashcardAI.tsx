@@ -2,7 +2,8 @@ import type { ChangeEvent } from 'react';
 import { useMemo, useState } from 'react';
 import { getBackendReadiness } from '../api/config';
 import { ensureStudyFolder, uploadFolderAssets } from '../api/folders';
-import { requestFlashcards } from '../api/generation';
+import { generateFlashcardsWithOpenAI, requestFlashcards } from '../api/generation';
+import { isOpenAIConfigured } from '../api/openai';
 
 type UploadState = 'idle' | 'processing' | 'complete';
 
@@ -14,10 +15,11 @@ interface Flashcard {
 }
 
 const tags = ['Key idea', 'Formula', 'Case study', 'Mnemonic', 'Follow-up'];
+const NOTES_PLACEHOLDER = 'Paste extra context or lecture takeaways...';
 
 export function FlashcardAI() {
   const [files, setFiles] = useState<File[]>([]);
-  const [notes, setNotes] = useState('Paste extra context or lecture takeaways...');
+  const [notes, setNotes] = useState(NOTES_PLACEHOLDER);
   const [state, setState] = useState<UploadState>('idle');
   const [cards, setCards] = useState<Flashcard[]>([]);
   const [summary, setSummary] = useState('');
@@ -27,16 +29,84 @@ export function FlashcardAI() {
 
   const backendReadiness = getBackendReadiness();
   const backendReady = backendReadiness === 'ready';
+  const openAIReady = isOpenAIConfigured();
+
+  type Tone = 'success' | 'warning' | 'danger';
+  const tone: Tone = backendReady
+    ? 'success'
+    : openAIReady
+      ? 'success'
+      : backendReadiness === 'partial'
+        ? 'warning'
+        : 'danger';
+  const statusLabel = backendReady
+    ? 'Supabase Edge Functions connected'
+    : openAIReady
+      ? 'Direct OpenAI (gpt-4o-mini)'
+      : backendReadiness === 'partial'
+        ? 'Missing Supabase Function URL'
+        : 'Local preview only';
+
+  const toneStyles: Record<Tone, { background: string; color: string }> = {
+    success: { background: 'rgba(34, 197, 94, 0.18)', color: '#16a34a' },
+    warning: { background: 'rgba(251, 191, 36, 0.18)', color: '#ca8a04' },
+    danger: { background: 'rgba(248, 113, 113, 0.18)', color: '#dc2626' }
+  };
 
   const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const uploaded = Array.from(event.target.files ?? []);
     setFiles(uploaded);
   };
 
+  const prepareMaterials = async (selectedFiles: File[]) => {
+    const materialPromises = selectedFiles.map(
+      (file) =>
+        new Promise<string>((resolve) => {
+          const reader = new FileReader();
+
+          reader.onload = () => {
+            if (typeof reader.result !== 'string') {
+              resolve('');
+              return;
+            }
+
+            const preview = reader.result.slice(0, 2000);
+
+            if (file.type.startsWith('text/') || /\.(md|txt|csv)$/i.test(file.name)) {
+              resolve(`Text file ${file.name}: ${preview}`);
+              return;
+            }
+
+            if (file.type === 'application/pdf') {
+              resolve(`PDF document ${file.name} (base64 preview): ${preview}`);
+              return;
+            }
+
+            if (file.type.startsWith('image/')) {
+              resolve(`Image ${file.name} encoded as data URL: ${preview}`);
+              return;
+            }
+
+            resolve(`File ${file.name} encoded as data URL: ${preview}`);
+          };
+
+          if (file.type.startsWith('text/') || /\.(md|txt|csv)$/i.test(file.name)) {
+            reader.readAsText(file);
+          } else {
+            reader.readAsDataURL(file);
+          }
+        })
+    );
+
+    const materials = await Promise.all(materialPromises);
+    return materials.filter(Boolean);
+  };
+
   const generateFlashcards = async () => {
     try {
       setError(null);
       setState('processing');
+      const notePayload = notes === NOTES_PLACEHOLDER ? '' : notes.trim();
 
       if (backendReady) {
         const folder = await ensureStudyFolder(folderName);
@@ -48,7 +118,7 @@ export function FlashcardAI() {
 
         const { flashcards, summary: backendSummary } = await requestFlashcards({
           folderId: folder.id,
-          notes: notes.trim() || undefined
+          notes: notePayload || undefined
         });
 
         const normalized = flashcards.map((card, index) => ({
@@ -64,18 +134,32 @@ export function FlashcardAI() {
         return;
       }
 
-      const aggregateText = await Promise.all(
-        files.map(
-          (file) =>
-            new Promise<string>((resolve) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
-              reader.readAsText(file);
-            })
-        )
-      );
+      if (openAIReady) {
+        const materials = await prepareMaterials(files);
+        const { flashcards: aiCards, summary: aiSummary } = await generateFlashcardsWithOpenAI({
+          focus: folderName,
+          notes: notePayload,
+          materials,
+          cardCount: Math.max(4, Math.min(10, files.length * 2 || 6))
+        });
 
-      const base = `${notes}\n${aggregateText.join('\n')}`.trim();
+        const normalized = aiCards.map((card, index) => ({
+          id: index + 1,
+          front: card.front,
+          back: card.back,
+          tag: card.tag ?? tags[index % tags.length]
+        }));
+
+        setCards(normalized);
+        setFolderId('openai-session');
+        setSummary(aiSummary);
+        setState('complete');
+        return;
+      }
+
+      const aggregateText = await Promise.all(files.map((file) => prepareMaterials([file])));
+      const flattened = aggregateText.flat();
+      const base = `${notePayload}\n${flattened.join('\n')}`.trim();
       const insightSeed = base.slice(0, 280) || 'Your study materials';
 
       const generated: Flashcard[] = Array.from({ length: 4 }, (_, idx) => ({
@@ -130,21 +214,11 @@ export function FlashcardAI() {
               borderRadius: 999,
               fontSize: '0.78rem',
               fontWeight: 600,
-              background:
-                backendReadiness === 'ready'
-                  ? 'rgba(34, 197, 94, 0.18)'
-                  : backendReadiness === 'partial'
-                    ? 'rgba(251, 191, 36, 0.18)'
-                    : 'rgba(248, 113, 113, 0.18)',
-              color:
-                backendReadiness === 'ready'
-                  ? '#16a34a'
-                  : backendReadiness === 'partial'
-                    ? '#ca8a04'
-                    : '#dc2626'
+              background: toneStyles[tone].background,
+              color: toneStyles[tone].color
             }}
           >
-            Backend {backendReadiness === 'ready' ? 'connected' : backendReadiness === 'partial' ? 'missing function URL' : 'not configured'}
+            {statusLabel}
           </span>
           {folderId && (
             <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Last folder: {folderId}</span>
