@@ -1,5 +1,8 @@
 import type { ChangeEvent } from 'react';
 import { useMemo, useState } from 'react';
+import { getBackendReadiness } from '../api/config';
+import { ensureStudyFolder, uploadFolderAssets } from '../api/folders';
+import { requestFlashcards } from '../api/generation';
 
 type UploadState = 'idle' | 'processing' | 'complete';
 
@@ -18,6 +21,12 @@ export function FlashcardAI() {
   const [state, setState] = useState<UploadState>('idle');
   const [cards, setCards] = useState<Flashcard[]>([]);
   const [summary, setSummary] = useState('');
+  const [folderName, setFolderName] = useState('Neural Networks Sprint');
+  const [folderId, setFolderId] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  const backendReadiness = getBackendReadiness();
+  const backendReady = backendReadiness === 'ready';
 
   const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
     const uploaded = Array.from(event.target.files ?? []);
@@ -25,38 +34,71 @@ export function FlashcardAI() {
   };
 
   const generateFlashcards = async () => {
-    setState('processing');
+    try {
+      setError(null);
+      setState('processing');
 
-    const aggregateText = await Promise.all(
-      files.map(
-        (file) =>
-          new Promise<string>((resolve) => {
-            const reader = new FileReader();
-            reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
-            reader.readAsText(file);
-          })
-      )
-    );
+      if (backendReady) {
+        const folder = await ensureStudyFolder(folderName);
+        setFolderId(folder.id);
 
-    const base = `${notes}\n${aggregateText.join('\n')}`.trim();
-    const insightSeed = base.slice(0, 280) || 'Your study materials';
+        if (files.length > 0) {
+          await uploadFolderAssets(folder.id, files);
+        }
 
-    const generated: Flashcard[] = Array.from({ length: 4 }, (_, idx) => ({
-      id: idx + 1,
-      front: `Essential concept ${idx + 1}`,
-      back: `AI summary of "${insightSeed}" focusing on insight ${idx + 1}.`,
-      tag: tags[idx % tags.length]
-    }));
+        const { flashcards, summary: backendSummary } = await requestFlashcards({
+          folderId: folder.id,
+          notes: notes.trim() || undefined
+        });
 
-    setCards(generated);
-    setSummary(
-      `Focus on ${generated
-        .map((card) => card.tag.toLowerCase())
-        .slice(0, 3)
-        .join(', ')}. Schedule your next review in ${(generated.length + 1) * 3} hours.`
-    );
+        const normalized = flashcards.map((card, index) => ({
+          id: Number(card.id ?? index + 1),
+          front: card.front,
+          back: card.back,
+          tag: card.tag ?? tags[index % tags.length]
+        }));
 
-    setTimeout(() => setState('complete'), 600);
+        setCards(normalized);
+        setSummary(backendSummary);
+        setState('complete');
+        return;
+      }
+
+      const aggregateText = await Promise.all(
+        files.map(
+          (file) =>
+            new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : '');
+              reader.readAsText(file);
+            })
+        )
+      );
+
+      const base = `${notes}\n${aggregateText.join('\n')}`.trim();
+      const insightSeed = base.slice(0, 280) || 'Your study materials';
+
+      const generated: Flashcard[] = Array.from({ length: 4 }, (_, idx) => ({
+        id: idx + 1,
+        front: `Essential concept ${idx + 1}`,
+        back: `AI summary of "${insightSeed}" focusing on insight ${idx + 1}.`,
+        tag: tags[idx % tags.length]
+      }));
+
+      setCards(generated);
+      setFolderId('local-preview');
+      setSummary(
+        `Focus on ${generated
+          .map((card) => card.tag.toLowerCase())
+          .slice(0, 3)
+          .join(', ')}. Schedule your next review in ${(generated.length + 1) * 3} hours.`
+      );
+      setTimeout(() => setState('complete'), 600);
+    } catch (generationError) {
+      console.error(generationError);
+      setError(generationError instanceof Error ? generationError.message : 'Unable to generate flashcards right now.');
+      setState('idle');
+    }
   };
 
   const previewNames = useMemo(() => files.map((file) => file.name).join(', '), [files]);
@@ -81,6 +123,34 @@ export function FlashcardAI() {
           border: '1px solid var(--outline)'
         }}
       >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.8rem' }}>
+          <span
+            style={{
+              padding: '0.3rem 0.85rem',
+              borderRadius: 999,
+              fontSize: '0.78rem',
+              fontWeight: 600,
+              background:
+                backendReadiness === 'ready'
+                  ? 'rgba(34, 197, 94, 0.18)'
+                  : backendReadiness === 'partial'
+                    ? 'rgba(251, 191, 36, 0.18)'
+                    : 'rgba(248, 113, 113, 0.18)',
+              color:
+                backendReadiness === 'ready'
+                  ? '#16a34a'
+                  : backendReadiness === 'partial'
+                    ? '#ca8a04'
+                    : '#dc2626'
+            }}
+          >
+            Backend {backendReadiness === 'ready' ? 'connected' : backendReadiness === 'partial' ? 'missing function URL' : 'not configured'}
+          </span>
+          {folderId && (
+            <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Last folder: {folderId}</span>
+          )}
+        </div>
+
         <label
           style={{
             padding: '1.5rem',
@@ -106,6 +176,22 @@ export function FlashcardAI() {
           {previewNames && (
             <span style={{ fontSize: '0.85rem', color: 'var(--accent)' }}>Selected: {previewNames}</span>
           )}
+        </label>
+
+        <label style={{ display: 'grid', gap: '0.45rem' }}>
+          <span style={{ fontWeight: 600 }}>Study folder name</span>
+          <input
+            value={folderName}
+            onChange={(event) => setFolderName(event.target.value)}
+            placeholder="e.g., Anatomy finals review"
+            style={{
+              padding: '0.85rem 1rem',
+              borderRadius: '18px',
+              border: '1px solid var(--outline)',
+              background: 'var(--surface-strong)',
+              color: 'var(--text)'
+            }}
+          />
         </label>
 
         <label style={{ display: 'grid', gap: '0.45rem' }}>
@@ -143,6 +229,22 @@ export function FlashcardAI() {
             The AI aligns difficulty with your quiz settings for seamless review flows.
           </span>
         </div>
+
+        {error && (
+          <div
+            role="alert"
+            style={{
+              padding: '0.9rem 1.1rem',
+              borderRadius: 'var(--radius-sm)',
+              background: 'rgba(248, 113, 113, 0.12)',
+              color: '#dc2626',
+              fontSize: '0.85rem',
+              border: '1px solid rgba(248, 113, 113, 0.35)'
+            }}
+          >
+            {error}
+          </div>
+        )}
 
         {state !== 'idle' && (
           <div

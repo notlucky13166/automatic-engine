@@ -1,4 +1,7 @@
 import { useMemo, useState } from 'react';
+import { getBackendReadiness } from '../api/config';
+import { ensureStudyFolder } from '../api/folders';
+import { requestQuiz } from '../api/generation';
 
 const questionTypes = ['Multiple choice', 'Open response', 'Image labeling', 'Audio comprehension', 'Code review'];
 
@@ -16,6 +19,13 @@ export function QuizBuilder() {
   const [includeImages, setIncludeImages] = useState(true);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [progress, setProgress] = useState(0);
+  const [folderName, setFolderName] = useState('Neural Networks Sprint');
+  const [folderId, setFolderId] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  const backendReadiness = getBackendReadiness();
+  const backendReady = backendReadiness === 'ready';
 
   const questionPool = useMemo(() => {
     const basePrompts = [
@@ -35,17 +45,55 @@ export function QuizBuilder() {
   }, [difficulty]);
 
   const handleGenerate = () => {
-    const newQuestions = Array.from({ length: questionCount }, (_, idx) => {
-      const template = questionPool[idx % questionPool.length];
-      return {
-        ...template,
-        id: idx + 1,
-        prompt: `${template.prompt} (Topic: ${topic})`
-      };
-    });
+    const run = async () => {
+      try {
+        setError(null);
+        setIsGenerating(true);
 
-    setQuestions(newQuestions);
-    setProgress((prev) => Math.min(100, prev + 25));
+        if (backendReady) {
+          const folder = await ensureStudyFolder(folderName);
+          setFolderId(folder.id);
+
+          const { questions: remoteQuestions, progress: remoteProgress } = await requestQuiz({
+            folderId: folder.id,
+            questionCount,
+            difficulty,
+            includeImages
+          });
+
+          setQuestions(
+            remoteQuestions.map((question, index) => ({
+              id: Number(question.id ?? index + 1),
+              prompt: question.prompt,
+              type: question.type,
+              difficulty: question.difficulty
+            }))
+          );
+          setProgress(Math.max(0, Math.min(100, remoteProgress)));
+          return;
+        }
+
+        const newQuestions = Array.from({ length: questionCount }, (_, idx) => {
+          const template = questionPool[idx % questionPool.length];
+          return {
+            ...template,
+            id: idx + 1,
+            prompt: `${template.prompt} (Topic: ${topic})`
+          };
+        });
+
+        setQuestions(newQuestions);
+        setFolderId('local-preview');
+        setProgress((prev) => Math.min(100, prev + 25));
+      } catch (generationError) {
+        console.error(generationError);
+        setError(generationError instanceof Error ? generationError.message : 'Unable to generate a quiz right now.');
+      } finally {
+        setIsGenerating(false);
+      }
+    };
+
+    void run();
   };
 
   return (
@@ -130,8 +178,51 @@ export function QuizBuilder() {
         </label>
       </div>
 
+      <label style={{ display: 'grid', gap: '0.45rem' }}>
+        <span style={{ fontWeight: 600 }}>Study folder name</span>
+        <input
+          value={folderName}
+          onChange={(event) => setFolderName(event.target.value)}
+          placeholder="e.g., Anatomy finals review"
+          style={{
+            padding: '0.85rem 1rem',
+            borderRadius: '18px',
+            border: '1px solid var(--outline)',
+            background: 'var(--surface-strong)',
+            color: 'var(--text)'
+          }}
+        />
+      </label>
+
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '0.8rem' }}>
+        <span
+          style={{
+            padding: '0.3rem 0.85rem',
+            borderRadius: 999,
+            fontSize: '0.78rem',
+            fontWeight: 600,
+            background:
+              backendReadiness === 'ready'
+                ? 'rgba(34, 197, 94, 0.18)'
+                : backendReadiness === 'partial'
+                  ? 'rgba(251, 191, 36, 0.18)'
+                  : 'rgba(248, 113, 113, 0.18)',
+            color:
+              backendReadiness === 'ready'
+                ? '#16a34a'
+                : backendReadiness === 'partial'
+                  ? '#ca8a04'
+                  : '#dc2626'
+          }}
+        >
+          Backend {backendReadiness === 'ready' ? 'connected' : backendReadiness === 'partial' ? 'missing function URL' : 'not configured'}
+        </span>
+        {folderId && <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Last folder: {folderId}</span>}
+      </div>
+
       <button
         onClick={handleGenerate}
+        disabled={isGenerating}
         style={{
           justifySelf: 'flex-start',
           padding: '0.95rem 2rem',
@@ -143,8 +234,24 @@ export function QuizBuilder() {
           letterSpacing: '0.02em'
         }}
       >
-        Generate adaptive quiz
+        {isGenerating ? 'Generating...' : 'Generate adaptive quiz'}
       </button>
+
+      {error && (
+        <div
+          role="alert"
+          style={{
+            padding: '0.9rem 1.1rem',
+            borderRadius: 'var(--radius-sm)',
+            background: 'rgba(248, 113, 113, 0.12)',
+            color: '#dc2626',
+            fontSize: '0.85rem',
+            border: '1px solid rgba(248, 113, 113, 0.35)'
+          }}
+        >
+          {error}
+        </div>
+      )}
 
       <div style={{ display: 'grid', gap: '1rem' }}>
         <div
